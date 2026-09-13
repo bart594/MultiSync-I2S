@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <signal.h>
