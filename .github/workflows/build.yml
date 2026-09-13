@@ -44,11 +44,13 @@ jobs:
       - name: Cache Buildroot host toolchain
         uses: actions/cache@v4
         with:
-          path: buildroot/output/host
-          key: buildroot-host-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}-${{ github.sha }}
+          path: |
+            buildroot/output/host
+            buildroot/output/staging
+          key: buildroot-output-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}-${{ github.sha }}
           restore-keys: |
-            buildroot-host-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}-
-            buildroot-host-
+            buildroot-output-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}-
+            buildroot-output-
 
       - name: Run build
         run: |
