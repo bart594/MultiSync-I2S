@@ -3,6 +3,11 @@ name: Build MultiSync-I2S image
 on:
   push:
     branches: [main, master]
+    paths-ignore:
+      - 'ext_tree/package/apscream-open/**'
+      - '.github/workflows/apscream-only.yml'
+      - '**.md'
+      - '.gitignore'
   workflow_dispatch:
 
 jobs:

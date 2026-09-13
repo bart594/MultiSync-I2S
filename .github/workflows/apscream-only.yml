@@ -1,6 +1,11 @@
 name: Build apscream-open only
 
 on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'ext_tree/package/apscream-open/**'
+      - '.github/workflows/apscream-only.yml'
   workflow_dispatch:
 
 jobs:
