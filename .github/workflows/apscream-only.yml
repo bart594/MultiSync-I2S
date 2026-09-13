@@ -1,0 +1,75 @@
+name: Build apscream-open only
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git rsync build-essential cmake device-tree-compiler \
+            bc binutils libncurses-dev clang llvm libclang-dev lld \
+            unzip bzip2 wget file cpio python3 perl gawk \
+            libssl-dev flex bison gettext autoconf automake libtool \
+            pkg-config texinfo help2man
+
+      - name: Restore Buildroot downloads
+        uses: actions/cache@v4
+        with:
+          path: buildroot/dl
+          key: buildroot-dl-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}
+          restore-keys: buildroot-dl-
+
+      - name: Restore Buildroot output
+        uses: actions/cache@v4
+        with:
+          path: |
+            buildroot/output/host
+            buildroot/output/staging
+            buildroot/output/build
+          key: buildroot-output-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}-${{ github.sha }}
+          restore-keys: |
+            buildroot-output-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}-
+            buildroot-output-
+
+      - name: Configure Buildroot
+        run: |
+          cd buildroot
+          make BR2_EXTERNAL=../ext_tree luckfox_pico_max_defconfig
+
+      - name: Rebuild only apscream-open
+        run: |
+          cd buildroot
+          make BR2_EXTERNAL=../ext_tree apscream-open-dirclean
+          make BR2_EXTERNAL=../ext_tree apscream-open
+
+      - name: Extract binary
+        run: |
+          mkdir -p output-bin
+          cp buildroot/output/target/usr/bin/apscream-open output-bin/
+          file output-bin/apscream-open || true
+          ls -la output-bin/
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: apscream-open-binary
+          path: output-bin/apscream-open
+          retention-days: 30
