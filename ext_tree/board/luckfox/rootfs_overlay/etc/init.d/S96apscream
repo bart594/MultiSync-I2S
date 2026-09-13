@@ -1,0 +1,38 @@
+#!/bin/sh
+
+start() {
+    printf "Starting apscream-open: "
+    echo 500 > /sys/devices/platform/ffae0000.i2s/master_start_delay_ms
+    echo 100 > /sys/devices/platform/ffae0000.i2s/master_stop_bclk_hold_ms
+    echo 0 > /sys/devices/platform/ffae0000.i2s/post_stop_reset_hclk
+    echo 0 > /sys/devices/platform/ffae0000.i2s/post_stop_reset_rx
+    echo 1 > /sys/devices/platform/ffae0000.i2s/post_stop_reset_tx
+    echo 0 > /sys/devices/platform/ffae0000.i2s/pre_start_reset_hclk
+    echo 1 > /sys/devices/platform/ffae0000.i2s/pre_start_reset_tx
+    echo 0 > /sys/devices/platform/ffae0000.i2s/pre_start_reset_rx
+    if [ -f /usr/lib/libasound_nodrain.so ]; then
+        LD_PRELOAD=/usr/lib/libasound_nodrain.so /usr/bin/apscream-open -c /etc/apscream.conf > /dev/null 2>&1 &
+    else
+        /usr/bin/apscream-open -c /etc/apscream.conf > /dev/null 2>&1 &
+    fi
+    echo "OK"
+}
+
+stop() {
+    printf "Stopping apscream-open: "
+    killall -9 apscream-open 2>/dev/null
+    echo "OK"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+case "$1" in
+  start|stop|restart) "$1" ;;
+  *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+
+exit $?

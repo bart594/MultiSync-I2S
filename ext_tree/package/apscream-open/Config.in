@@ -1,0 +1,5 @@
+config BR2_PACKAGE_APSCREAM_OPEN
+bool "apscream-open"
+help
+  Scream audio receiver (open source) - odbiera strumien audio
+  przez UDP/TCP/L2 i odtwarza go przez ALSA.

@@ -1,0 +1,79 @@
+name: Build MultiSync-I2S image
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git rsync build-essential cmake device-tree-compiler \
+            bc binutils libncurses-dev clang llvm libclang-dev lld \
+            unzip bzip2 wget file cpio python3 perl gawk \
+            libssl-dev flex bison gettext autoconf automake libtool \
+            pkg-config texinfo help2man
+
+      - name: Cache Buildroot downloads
+        uses: actions/cache@v4
+        with:
+          path: buildroot/dl
+          key: buildroot-dl-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}
+          restore-keys: |
+            buildroot-dl-
+
+      - name: Cache Buildroot host toolchain
+        uses: actions/cache@v4
+        with:
+          path: buildroot/output/host
+          key: buildroot-host-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}-${{ github.sha }}
+          restore-keys: |
+            buildroot-host-${{ hashFiles('ext_tree/configs/luckfox_pico_max_defconfig') }}-
+            buildroot-host-
+
+      - name: Run build
+        run: |
+          chmod +x build.sh
+          ./build.sh 2>&1 | tee build.log
+
+      - name: List output images
+        if: always()
+        run: |
+          ls -la buildroot/output/images/ || true
+          tail -100 build.log || true
+
+      - name: Upload image
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luckfox-image-${{ github.sha }}
+          path: buildroot/output/images/*.img
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.sha }}
+          path: build.log
+          retention-days: 7
