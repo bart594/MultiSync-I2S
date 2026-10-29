@@ -1,0 +1,123 @@
+name: Build APScream IPK for OpenWrt 24.10.8 QEMU
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - name: Install SDK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ca-certificates curl git zstd \
+            rsync unzip file gawk perl wget python3 libncurses-dev \
+            libssl-dev flex bison gettext autoconf automake libtool pkg-config
+
+      - name: Download and verify official OpenWrt SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE='openwrt-sdk-24.10.8-armsr-armv7_gcc-13.3.0_musl_eabi.Linux-x86_64.tar.zst'
+          BASE='https://downloads.openwrt.org/releases/24.10.8/targets/armsr/armv7'
+          curl -fL --retry 3 "$BASE/$FILE" -o "$FILE"
+          echo "c30c6fc09d8038351e1cccb7d8565d8f3e4447dd017d15de8c7e83960fdb4718  $FILE" | sha256sum -c -
+          mkdir sdk
+          tar --zstd -xf "$FILE" -C sdk --strip-components=1
+
+      - name: Fetch pinned APScream source and fix ALSA null pointers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sdk/package/apscream-open/src
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/bart594/MultiSync-I2S/4611e49b22e65040dfddf9c5a23b032e788b1626/ext_tree/package/apscream-open/apscream_open.c \
+            -o sdk/package/apscream-open/src/apscream_open.c
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('sdk/package/apscream-open/src/apscream_open.c')
+          s=p.read_text()
+          fixes={
+              'snd_pcm_get_params(ctx->pcm_handle, &buf_frames, NULL);':
+                  'snd_pcm_uframes_t warmup_period = 0;\n    snd_pcm_get_params(ctx->pcm_handle, &buf_frames, &warmup_period);',
+              'snd_pcm_get_params(ctx->pcm_handle, &buf_size, NULL);':
+                  'snd_pcm_uframes_t pll_period = 0;\n                    snd_pcm_get_params(ctx->pcm_handle, &buf_size, &pll_period);',
+          }
+          for old,new in fixes.items():
+              assert s.count(old) == 1, f'Nieoczekiwana zmiana zrodla: {old}'
+              s=s.replace(old,new)
+          p.write_text(s)
+          print('Dwie poprawki snd_pcm_get_params zastosowane')
+          PY
+
+      - name: Write OpenWrt package definition
+        shell: bash
+        run: |
+          cat > sdk/package/apscream-open/Makefile <<'MK'
+          include $(TOPDIR)/rules.mk
+
+          PKG_NAME:=apscream-open
+          PKG_VERSION:=3.2
+          PKG_RELEASE:=1
+          PKG_LICENSE:=UNKNOWN
+          PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+
+          include $(INCLUDE_DIR)/package.mk
+
+          define Package/apscream-open
+            SECTION:=sound
+            CATEGORY:=Sound
+            TITLE:=APScream test receiver for OpenWrt ARMv7
+            DEPENDS:=+alsa-lib
+          endef
+
+          define Build/Prepare
+          	mkdir -p $(PKG_BUILD_DIR)
+          	$(CP) $(TOPDIR)/package/apscream-open/src/apscream_open.c $(PKG_BUILD_DIR)/
+          endef
+
+          define Build/Compile
+          	$(TARGET_CC) $(TARGET_CFLAGS) -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard \
+          		-o $(PKG_BUILD_DIR)/apscream-open $(PKG_BUILD_DIR)/apscream_open.c \
+          		$(TARGET_LDFLAGS) -lasound -pthread
+          endef
+
+          define Package/apscream-open/install
+          	$(INSTALL_DIR) $(1)/usr/bin
+          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/apscream-open $(1)/usr/bin/
+          endef
+
+          $(eval $(call BuildPackage,apscream-open))
+          MK
+
+      - name: Build package with OpenWrt SDK
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update packages
+          ./scripts/feeds install alsa-lib
+          echo 'CONFIG_PACKAGE_alsa-lib=m' >> .config
+          echo 'CONFIG_PACKAGE_apscream-open=m' >> .config
+          make defconfig
+          make -j1 package/feeds/packages/alsa-lib/compile V=sc
+          make -j1 package/apscream-open/compile V=sc
+          find bin -name 'apscream-open_*.ipk' -print
+          IPK=$(find bin -type f -name 'apscream-open_*.ipk' -print -quit)
+          test -n "$IPK"
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cp "$IPK" "$GITHUB_WORKSPACE/release/apscream-open.ipk"
+          file "$GITHUB_WORKSPACE/release/apscream-open.ipk"
+          sha256sum "$GITHUB_WORKSPACE/release/apscream-open.ipk"
+
+      - name: Upload OpenWrt package
+        uses: actions/upload-artifact@v4
+        with:
+          name: apscream-open-openwrt-24.10.8-armv7
+          path: release/apscream-open.ipk
+          if-no-files-found: error
+          retention-days: 14
