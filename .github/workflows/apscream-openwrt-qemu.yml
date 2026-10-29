@@ -1,4 +1,4 @@
-name: Build APScream IPK for OpenWrt 24.10.8 QEMU (RT fix)
+name: Build APScream IPK for OpenWrt 24.10.8 QEMU (DIAG 3.3)
 
 on:
   workflow_dispatch:
@@ -40,8 +40,10 @@ jobs:
           cp ext_tree/package/apscream-open/apscream_open.c \
             sdk/package/apscream-open/src/apscream_open.c
           grep -q 'ALSA_IDLE_SLEEP_US' sdk/package/apscream-open/src/apscream_open.c
+          grep -q '3.3-DIAG-RV1106' sdk/package/apscream-open/src/apscream_open.c
+          grep -q 'DIAG_INTERVAL_MS' sdk/package/apscream-open/src/apscream_open.c
           ! grep -q 'snd_pcm_get_params(.*NULL' sdk/package/apscream-open/src/apscream_open.c
-          echo 'APScream from checkout with RT idle fix and ALSA fixes'
+          echo 'APScream 3.3 diagnostics from checkout; RT and ALSA fixes preserved'
 
       - name: Write OpenWrt package definition
         shell: bash
@@ -50,8 +52,8 @@ jobs:
           include $(TOPDIR)/rules.mk
 
           PKG_NAME:=apscream-open
-          PKG_VERSION:=3.2
-          PKG_RELEASE:=2
+          PKG_VERSION:=3.3
+          PKG_RELEASE:=1
           PKG_LICENSE:=UNKNOWN
           PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 
@@ -106,7 +108,7 @@ jobs:
       - name: Upload OpenWrt package
         uses: actions/upload-artifact@v4
         with:
-          name: apscream-open-openwrt-24.10.8-armv7
+          name: apscream-open-3.3-diag-openwrt-24.10.8-armv7
           path: release/apscream-open.ipk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 14 
