@@ -25,7 +25,7 @@
 #include <linux/if_ether.h>
 #include <alsa/asoundlib.h>
 
-#define AP_VERSION "3.2-RT-IDLE-FIX-RV1106"
+#define AP_VERSION "3.3-DIAG-RV1106"
 
 #define MAX_PACKET_SIZE       9216
 #define RING_BUFFER_SIZE      (4 * 1024 * 1024)
@@ -71,6 +71,31 @@ typedef struct {
     volatile size_t drop_bytes;
 } spsc_ring_t;
 
+/* Counters use 32-bit atomic operations: native/lock-free on ARMv7.
+ * Values are exchanged by the non-RT main thread at DIAG_INTERVAL_MS.
+ * Packet loss on the wire cannot be inferred without sender sequence IDs. */
+typedef struct {
+    unsigned int rx_packets;
+    unsigned int rx_wire_bytes;
+    unsigned int rx_audio_bytes;
+    unsigned int invalid_headers;
+    unsigned int short_packets;
+    unsigned int queued_audio_bytes;
+    unsigned int ring_drop_packets;
+    unsigned int ring_drop_bytes;
+    unsigned int discarded_on_reinit;
+    unsigned int rebuffer_events;
+    unsigned int alsa_frames_written;
+    unsigned int alsa_errors;
+    unsigned int alsa_xruns;
+    unsigned int rw_discarded_frames;
+    unsigned int format_reinits;
+    unsigned int format_failures;
+    unsigned int feedback_sent;
+    int last_feedback_ppm;
+    int last_alsa_delay_frames;
+} diagnostics_t;
+
 typedef struct {
     receiver_mode_t mode;
     char iface[16];
@@ -90,6 +115,9 @@ typedef struct {
     size_t preload_frames;
     bool feedback_pll;
     bool use_mmap_cfg;
+    bool diag_enabled;
+    unsigned int diag_interval_ms;
+    diagnostics_t diag;
 
     int sock_fd;
     int tcp_client_fd;
@@ -119,6 +147,21 @@ typedef struct {
 } receiver_ctx_t;
 
 static receiver_ctx_t g_ctx;
+
+#define DIAG_ADD(ctx, field, amount) do { \
+    if ((ctx)->diag_enabled) \
+        __atomic_fetch_add(&(ctx)->diag.field, (unsigned int)(amount), __ATOMIC_RELAXED); \
+} while (0)
+
+static inline unsigned int diag_take(unsigned int *value) {
+    return __atomic_exchange_n(value, 0U, __ATOMIC_RELAXED);
+}
+
+static double timespec_sec(const struct timespec *t) {
+    return (double)t->tv_sec + (double)t->tv_nsec / 1000000000.0;
+}
+
+/* Called only by the regular-priority main thread. Does not touch ALSA APIs. */
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -186,6 +229,13 @@ static bool load_config(const char *path, receiver_ctx_t *ctx) {
             ctx->feedback_pll = (atoi(val) != 0);
         } else if (strcasecmp(key, "MMAP") == 0) {
             ctx->use_mmap_cfg = (atoi(val) != 0);
+        } else if (strcasecmp(key, "DIAG") == 0) {
+            ctx->diag_enabled = (atoi(val) != 0);
+        } else if (strcasecmp(key, "DIAG_INTERVAL_MS") == 0) {
+            int interval = atoi(val);
+            if (interval < 250) interval = 250;
+            if (interval > 10000) interval = 10000;
+            ctx->diag_interval_ms = (unsigned int)interval;
         } else if (strcasecmp(key, "TCP_PACKET_SIZE") == 0) {
             ctx->tcp_packet_size = (size_t)strtoul(val, NULL, 10);
             if (ctx->tcp_packet_size < 16) ctx->tcp_packet_size = DEFAULT_TCP_PKT_SIZE;
@@ -216,9 +266,53 @@ static void try_load_default_configs(receiver_ctx_t *ctx, const char *user_path)
 /* --- SPSC Ring Buffer --- */
 
 static inline size_t ring_available(spsc_ring_t *r) {
-    size_t wp = r->write_pos;
-    size_t rp = r->read_pos;
+    size_t wp = __atomic_load_n(&r->write_pos, __ATOMIC_ACQUIRE);
+    size_t rp = __atomic_load_n(&r->read_pos, __ATOMIC_ACQUIRE);
     return (wp - rp) & RING_BUFFER_MASK;
+}
+
+static void diag_report(receiver_ctx_t *ctx, double seconds, double cpu_seconds,
+                        size_t ring_min, size_t ring_max) {
+    diagnostics_t *d = &ctx->diag;
+    if (seconds <= 0.0) return;
+    unsigned int pkts = diag_take(&d->rx_packets);
+    unsigned int wire = diag_take(&d->rx_wire_bytes);
+    unsigned int audio = diag_take(&d->rx_audio_bytes);
+    unsigned int queued = diag_take(&d->queued_audio_bytes);
+    unsigned int bad = diag_take(&d->invalid_headers);
+    unsigned int small = diag_take(&d->short_packets);
+    unsigned int drops = diag_take(&d->ring_drop_packets);
+    unsigned int dropped_bytes = diag_take(&d->ring_drop_bytes);
+    unsigned int flush = diag_take(&d->discarded_on_reinit);
+    unsigned int rebuffer = diag_take(&d->rebuffer_events);
+    unsigned int frames = diag_take(&d->alsa_frames_written);
+    unsigned int errors = diag_take(&d->alsa_errors);
+    unsigned int xruns = diag_take(&d->alsa_xruns);
+    unsigned int lost_rw = diag_take(&d->rw_discarded_frames);
+    unsigned int resets = diag_take(&d->format_reinits);
+    unsigned int reset_fail = diag_take(&d->format_failures);
+    unsigned int feedback = diag_take(&d->feedback_sent);
+    int ppm = __atomic_load_n(&d->last_feedback_ppm, __ATOMIC_RELAXED);
+    int alsa_delay = __atomic_load_n(&d->last_alsa_delay_frames, __ATOMIC_RELAXED);
+    size_t ring_now = ring_available(&ctx->ring);
+    /* CPU process time is guest-side approximation, not physical RV1106 load. */
+    printf("[DIAG] RX %.0f pkt/s %.1f KiB/s (payload %.1f, queued %.1f) "
+           "bad=%u short=%u\n",
+           (double)pkts / seconds, (double)wire / seconds / 1024.0,
+           (double)audio / seconds / 1024.0,
+           (double)queued / seconds / 1024.0, bad, small);
+    printf("[DIAG] Ring now=%zu KiB sampled_min=%zu max=%zu ",
+           ring_now / 1024, ring_min / 1024, ring_max / 1024);
+    printf("(%.1f%%) drops=%u (%u B) flush=%u B rebuffer=%u\n",
+           (double)ring_now * 100.0 / (double)RING_BUFFER_SIZE,
+           drops, dropped_bytes, flush, rebuffer);
+    printf("[DIAG] ALSA frames/s=%.0f err=%u xrun=%u rw_unwritten=%u "
+           "delay=%d frames | fmt_ok=%u fmt_err=%u\n",
+           (double)frames / seconds, errors, xruns, lost_rw,
+           alsa_delay, resets, reset_fail);
+    printf("[DIAG] PLL sent=%u last=%+d ppm | CPU(guest process)=%.1f%%\n",
+           feedback, ppm, cpu_seconds / seconds * 100.0);
+    fflush(stdout);
 }
 
 static inline size_t ring_free_space(spsc_ring_t *r) {
@@ -226,18 +320,18 @@ static inline size_t ring_free_space(spsc_ring_t *r) {
 }
 
 static inline void ring_clear_consumer(spsc_ring_t *r) {
-    r->read_pos = r->write_pos;
-    __sync_synchronize();
+    size_t wp = __atomic_load_n(&r->write_pos, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&r->read_pos, wp, __ATOMIC_RELEASE);
 }
 
-static inline void ring_push(spsc_ring_t *r, const uint8_t *data, size_t len) {
+static inline bool ring_push(spsc_ring_t *r, const uint8_t *data, size_t len) {
     size_t free_sp = ring_free_space(r);
     if (len > free_sp) {
-        r->drop_count++;
-        r->drop_bytes += len;
-        return;
+        __atomic_fetch_add(&r->drop_count, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&r->drop_bytes, len, __ATOMIC_RELAXED);
+        return false;
     }
-    size_t wp = r->write_pos;
+    size_t wp = __atomic_load_n(&r->write_pos, __ATOMIC_RELAXED);
     size_t first = RING_BUFFER_SIZE - wp;
     if (first >= len) {
         memcpy(r->buffer + wp, data, len);
@@ -245,8 +339,8 @@ static inline void ring_push(spsc_ring_t *r, const uint8_t *data, size_t len) {
         memcpy(r->buffer + wp, data, first);
         memcpy(r->buffer, data + first, len - first);
     }
-    __sync_synchronize();
-    r->write_pos = (wp + len) & RING_BUFFER_MASK;
+    __atomic_store_n(&r->write_pos, (wp + len) & RING_BUFFER_MASK, __ATOMIC_RELEASE);
+    return true;
 }
 
 static inline size_t ring_peek(spsc_ring_t *r, uint8_t *dest, size_t len) {
@@ -254,7 +348,7 @@ static inline size_t ring_peek(spsc_ring_t *r, uint8_t *dest, size_t len) {
     if (avail < len) len = avail;
     if (len == 0) return 0;
 
-    size_t rp = r->read_pos;
+    size_t rp = __atomic_load_n(&r->read_pos, __ATOMIC_RELAXED);
     size_t first = RING_BUFFER_SIZE - rp;
     if (first >= len) {
         memcpy(dest, r->buffer + rp, len);
@@ -266,9 +360,8 @@ static inline size_t ring_peek(spsc_ring_t *r, uint8_t *dest, size_t len) {
 }
 
 static inline void ring_consume(spsc_ring_t *r, size_t len) {
-    size_t rp = r->read_pos;
-    __sync_synchronize();
-    r->read_pos = (rp + len) & RING_BUFFER_MASK;
+    size_t rp = __atomic_load_n(&r->read_pos, __ATOMIC_RELAXED);
+    __atomic_store_n(&r->read_pos, (rp + len) & RING_BUFFER_MASK, __ATOMIC_RELEASE);
 }
 
 static inline size_t ring_pop(spsc_ring_t *r, uint8_t *dest, size_t len) {
@@ -637,10 +730,19 @@ static void *network_thread_fn(void *arg) {
             n = ctx->tcp_packet_size;
         }
 
-        if (n < (ssize_t)SCREAM_HEADER_SIZE) continue;
+        if (n <= 0) continue;
+        DIAG_ADD(ctx, rx_packets, 1);
+        DIAG_ADD(ctx, rx_wire_bytes, n);
+        if (n < (ssize_t)SCREAM_HEADER_SIZE) {
+            DIAG_ADD(ctx, short_packets, 1);
+            continue;
+        }
 
         scream_format_t fmt;
-        if (!parse_scream_header(rx_buf, &fmt)) continue;
+        if (!parse_scream_header(rx_buf, &fmt)) {
+            DIAG_ADD(ctx, invalid_headers, 1);
+            continue;
+        }
 
         if (fmt.end_of_track) {
             printf("[STREAM] Odebrano znacznik konca utworu (end_of_track).\n");
@@ -672,12 +774,18 @@ static void *network_thread_fn(void *arg) {
 
         uint8_t *audio_payload = rx_buf + SCREAM_HEADER_SIZE;
         size_t audio_len = n - SCREAM_HEADER_SIZE;
+        DIAG_ADD(ctx, rx_audio_bytes, audio_len);
 
         if (fmt.is_dsd && fmt.channels == 2 && audio_len >= 8) {
             dsd_deinterleave_fast(audio_payload, (audio_len / 8) * 8, ctx->dsd_swap_endian);
         }
 
-        ring_push(&ctx->ring, audio_payload, audio_len);
+        if (ring_push(&ctx->ring, audio_payload, audio_len)) {
+            DIAG_ADD(ctx, queued_audio_bytes, audio_len);
+        } else {
+            DIAG_ADD(ctx, ring_drop_packets, 1);
+            DIAG_ADD(ctx, ring_drop_bytes, audio_len);
+        }
     }
 
     pthread_mutex_lock(&ctx->tcp_mutex);
@@ -696,6 +804,8 @@ static inline void alsa_write_frames(receiver_ctx_t *ctx, size_t bpf) {
     if (ctx->use_mmap_active) {
         snd_pcm_sframes_t avail = snd_pcm_avail_update(ctx->pcm_handle);
         if (avail < 0) {
+            DIAG_ADD(ctx, alsa_errors, 1);
+            if (avail == -EPIPE) DIAG_ADD(ctx, alsa_xruns, 1);
             snd_pcm_recover(ctx->pcm_handle, avail, 0);
             return;
         }
@@ -714,6 +824,8 @@ static inline void alsa_write_frames(receiver_ctx_t *ctx, size_t bpf) {
 
             int err = snd_pcm_mmap_begin(ctx->pcm_handle, &areas, &offset, &chunk);
             if (err < 0) {
+                DIAG_ADD(ctx, alsa_errors, 1);
+                if (err == -EPIPE) DIAG_ADD(ctx, alsa_xruns, 1);
                 snd_pcm_recover(ctx->pcm_handle, err, 0);
                 break;
             }
@@ -727,6 +839,8 @@ static inline void alsa_write_frames(receiver_ctx_t *ctx, size_t bpf) {
 
             snd_pcm_sframes_t committed = snd_pcm_mmap_commit(ctx->pcm_handle, offset, chunk);
             if (committed < 0 || (snd_pcm_uframes_t)committed != chunk) {
+                DIAG_ADD(ctx, alsa_errors, 1);
+                if (committed == -EPIPE) DIAG_ADD(ctx, alsa_xruns, 1);
                 if (committed == -ENODEV) {
                     fprintf(stderr, "[ALSA] DAC odlaczony (-ENODEV)!\n");
                     snd_pcm_close(ctx->pcm_handle);
@@ -739,6 +853,7 @@ static inline void alsa_write_frames(receiver_ctx_t *ctx, size_t bpf) {
             }
 
             ring_consume(&ctx->ring, bytes);
+            DIAG_ADD(ctx, alsa_frames_written, chunk);
             frames -= chunk;
 
             if (snd_pcm_state(ctx->pcm_handle) == SND_PCM_STATE_PREPARED)
@@ -761,6 +876,9 @@ static inline void alsa_write_frames(receiver_ctx_t *ctx, size_t bpf) {
                                                      total - done);
                 if (n < 0) {
                     if (n == -EINTR) continue;
+                    DIAG_ADD(ctx, alsa_errors, 1);
+                    if (n == -EPIPE) DIAG_ADD(ctx, alsa_xruns, 1);
+                    DIAG_ADD(ctx, rw_discarded_frames, total - done);
                     if (n == -EPIPE) snd_pcm_prepare(ctx->pcm_handle);
                     else if (n == -ENODEV) {
                         fprintf(stderr, "[ALSA] DAC odlaczony (-ENODEV)!\n");
@@ -773,6 +891,7 @@ static inline void alsa_write_frames(receiver_ctx_t *ctx, size_t bpf) {
                     break;
                 }
                 done += n;
+                DIAG_ADD(ctx, alsa_frames_written, n);
             }
         }
     }
@@ -791,6 +910,7 @@ static void *alsa_thread_fn(void *arg) {
     uint64_t pll_ticks = 0;
     uint64_t loop_ticks = 0;
     size_t last_logged_drops = 0;
+    double last_diag_delay_check = 0.0;
 
     while (ctx->running) {
         bool need_reinit = __atomic_load_n(&ctx->fmt_change_requested, __ATOMIC_ACQUIRE) ||
@@ -798,7 +918,10 @@ static void *alsa_thread_fn(void *arg) {
 
         if (need_reinit) {
             state = STATE_PREFILLING;
+            DIAG_ADD(ctx, discarded_on_reinit, ring_available(&ctx->ring));
             ring_clear_consumer(&ctx->ring);
+            if (ctx->diag_enabled)
+                __atomic_store_n(&ctx->diag.last_alsa_delay_frames, -1, __ATOMIC_RELAXED);
             ema_delay = 0.0;
             pll_ticks = 0;
 
@@ -808,6 +931,7 @@ static void *alsa_thread_fn(void *arg) {
             pthread_mutex_unlock(&ctx->fmt_mutex);
 
             if (!reinit_alsa(ctx, &target)) {
+                DIAG_ADD(ctx, format_failures, 1);
                 __atomic_store_n(&ctx->fmt_failed, true, __ATOMIC_RELEASE);
                 pthread_mutex_lock(&ctx->fmt_mutex);
                 ctx->current_fmt = target;
@@ -819,6 +943,7 @@ static void *alsa_thread_fn(void *arg) {
                 continue;
             }
 
+            DIAG_ADD(ctx, format_reinits, 1);
             __atomic_store_n(&ctx->fmt_failed, false, __ATOMIC_RELEASE);
 
             pthread_mutex_lock(&ctx->fmt_mutex);
@@ -858,6 +983,7 @@ static void *alsa_thread_fn(void *arg) {
         } else if (state == STATE_PLAYING) {
             if (avail < bpf) {
                 state = STATE_PREFILLING;
+                DIAG_ADD(ctx, rebuffer_events, 1);
                 usleep(ALSA_IDLE_SLEEP_US);
                 continue;
             }
@@ -865,15 +991,36 @@ static void *alsa_thread_fn(void *arg) {
 
         loop_ticks++;
 
-        if (ctx->ring.drop_count != last_logged_drops && (loop_ticks % 100 == 0)) {
+        size_t total_drops = __atomic_load_n(&ctx->ring.drop_count, __ATOMIC_RELAXED);
+        if (total_drops != last_logged_drops && (loop_ticks % 100 == 0)) {
             printf("[RING] Przepelnienie: porzucono %zu pakietow (%zu B)\n",
-                   ctx->ring.drop_count, ctx->ring.drop_bytes);
-            last_logged_drops = ctx->ring.drop_count;
+                   total_drops,
+                   __atomic_load_n(&ctx->ring.drop_bytes, __ATOMIC_RELAXED));
+            last_logged_drops = total_drops;
+        }
+
+        /* ALSA calls remain in the ALSA thread (never in the reporter).
+         * Delay is sampled only ~2 times/s while DIAG=1. */
+        if (ctx->diag_enabled && (loop_ticks % 64 == 0) && ctx->pcm_handle) {
+            struct timespec ts;
+            if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+                double now = timespec_sec(&ts);
+                if (now - last_diag_delay_check >= 0.5) {
+                    snd_pcm_sframes_t d = 0;
+                    if (snd_pcm_delay(ctx->pcm_handle, &d) == 0)
+                        __atomic_store_n(&ctx->diag.last_alsa_delay_frames,
+                                         (int)d, __ATOMIC_RELAXED);
+                    last_diag_delay_check = now;
+                }
+            }
         }
 
         if (ctx->feedback_pll && ctx->has_host_addr && ctx->pcm_handle) {
             snd_pcm_sframes_t delay = 0;
             if (snd_pcm_delay(ctx->pcm_handle, &delay) == 0) {
+                if (ctx->diag_enabled)
+                    __atomic_store_n(&ctx->diag.last_alsa_delay_frames, (int)delay,
+                                     __ATOMIC_RELAXED);
                 ema_delay = (ema_delay == 0.0) ? delay : (0.95 * ema_delay + 0.05 * (double)delay);
 
                 if (++pll_ticks % 50 == 0) {
@@ -895,24 +1042,32 @@ static void *alsa_thread_fn(void *arg) {
                         if (feedback_ppm > 100) feedback_ppm = 100;
                     }
 
+                    if (ctx->diag_enabled)
+                        __atomic_store_n(&ctx->diag.last_feedback_ppm,
+                                         feedback_ppm, __ATOMIC_RELAXED);
                     if (feedback_ppm != 0) {
                         struct scream_feedback_pkt fb;
                         fb.magic = htonl(SCREAM_FEEDBACK_MAGIC);
                         fb.ppm_drift = htonl(feedback_ppm);
+                        ssize_t sent = -1;
 
                         if (ctx->mode == MODE_L2) {
-                            sendto(ctx->sock_fd, &fb, sizeof(fb), MSG_DONTWAIT,
-                                   (struct sockaddr *)&ctx->host_l2_addr, sizeof(ctx->host_l2_addr));
+                            sent = sendto(ctx->sock_fd, &fb, sizeof(fb), MSG_DONTWAIT,
+                                          (struct sockaddr *)&ctx->host_l2_addr,
+                                          sizeof(ctx->host_l2_addr));
                         } else if (ctx->mode == MODE_UDP) {
-                            sendto(ctx->sock_fd, &fb, sizeof(fb), MSG_DONTWAIT,
-                                   (struct sockaddr *)&ctx->host_udp_addr, sizeof(ctx->host_udp_addr));
+                            sent = sendto(ctx->sock_fd, &fb, sizeof(fb), MSG_DONTWAIT,
+                                          (struct sockaddr *)&ctx->host_udp_addr,
+                                          sizeof(ctx->host_udp_addr));
                         } else if (ctx->mode == MODE_TCP) {
                             pthread_mutex_lock(&ctx->tcp_mutex);
                             if (ctx->tcp_client_fd >= 0) {
-                                send(ctx->tcp_client_fd, &fb, sizeof(fb), MSG_DONTWAIT | MSG_NOSIGNAL);
+                                sent = send(ctx->tcp_client_fd, &fb, sizeof(fb),
+                                            MSG_DONTWAIT | MSG_NOSIGNAL);
                             }
                             pthread_mutex_unlock(&ctx->tcp_mutex);
                         }
+                        if (sent == (ssize_t)sizeof(fb)) DIAG_ADD(ctx, feedback_sent, 1);
                     }
                 }
             }
@@ -1115,6 +1270,9 @@ int main(int argc, char *argv[]) {
     g_ctx.tcp_packet_size = DEFAULT_TCP_PKT_SIZE;
     g_ctx.dsd_rate_mult = 1;
     g_ctx.udp_busy_poll_us = 0; /* single-core: domyslnie OFF */
+    g_ctx.diag_enabled = false; /* Avoid diagnostic overhead on target hardware. */
+    g_ctx.diag_interval_ms = 1000;
+    g_ctx.diag.last_alsa_delay_frames = -1;
     g_ctx.tcp_client_fd = -1;
     g_ctx.running = true;
 
@@ -1227,8 +1385,37 @@ int main(int argc, char *argv[]) {
                g_ctx.udp_busy_poll_us);
     }
 
+    if (g_ctx.diag_enabled) {
+        printf("[DIAG] Wlaczono diagnostyke co %u ms; ring min/max probkowany co 100 ms.\n",
+               g_ctx.diag_interval_ms);
+        fflush(stdout);
+    }
+    struct timespec last_wall = {0}, last_cpu = {0};
+    clock_gettime(CLOCK_MONOTONIC, &last_wall);
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &last_cpu);
+    size_t ring_min = ring_available(&g_ctx.ring);
+    size_t ring_max = ring_min;
     while (g_ctx.running) {
-        sleep(1);
+        if (!g_ctx.diag_enabled) {
+            sleep(1);
+            continue;
+        }
+        usleep(100000);
+        size_t occupied = ring_available(&g_ctx.ring);
+        if (occupied < ring_min) ring_min = occupied;
+        if (occupied > ring_max) ring_max = occupied;
+        struct timespec wall = {0}, cpu = {0};
+        clock_gettime(CLOCK_MONOTONIC, &wall);
+        double elapsed = timespec_sec(&wall) - timespec_sec(&last_wall);
+        if (elapsed * 1000.0 >= (double)g_ctx.diag_interval_ms) {
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
+            double cpu_elapsed = timespec_sec(&cpu) - timespec_sec(&last_cpu);
+            diag_report(&g_ctx, elapsed, cpu_elapsed, ring_min, ring_max);
+            last_wall = wall;
+            last_cpu = cpu;
+            ring_min = ring_available(&g_ctx.ring);
+            ring_max = ring_min;
+        }
     }
 
     printf("[SYS] Zamykanie watkow...\n");
