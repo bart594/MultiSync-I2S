@@ -25,7 +25,7 @@
 #include <linux/if_ether.h>
 #include <alsa/asoundlib.h>
 
-#define AP_VERSION "3.3-DIAG-RV1106"
+#define AP_VERSION "3.4-VIRTUAL-DAC-RV1106"
 
 #define MAX_PACKET_SIZE       9216
 #define RING_BUFFER_SIZE      (4 * 1024 * 1024)
@@ -37,6 +37,10 @@
 
 /* Max 1 ms latency when network/ALSA have no work; yield the single CPU. */
 #define ALSA_IDLE_SLEEP_US   1000
+
+/* Virtual DAC is a test-only clock model, NEVER a physical I2S emulator. */
+#define VDAC_DEFAULT_CAPACITY 8192
+#define VDAC_DEFAULT_TICK_US 1000
 
 typedef enum {
     MODE_UDP,
@@ -91,6 +95,12 @@ typedef struct {
     unsigned int rw_discarded_frames;
     unsigned int format_reinits;
     unsigned int format_failures;
+    unsigned int vdac_frames_consumed;
+    unsigned int vdac_underflow_events;
+    unsigned int vdac_missing_frames;
+    unsigned int vdac_frames_accepted;
+    unsigned int vdac_capacity_frames; /* atomic snapshot, not exchange */
+    unsigned int vdac_fill_frames;     /* atomic snapshot, not exchange */
     unsigned int feedback_sent;
     int last_feedback_ppm;
     int last_alsa_delay_frames;
@@ -117,6 +127,17 @@ typedef struct {
     bool use_mmap_cfg;
     bool diag_enabled;
     unsigned int diag_interval_ms;
+    bool vdac_enabled;
+    int vdac_rate_ppm;
+    size_t vdac_buffer_frames;
+    unsigned int vdac_tick_us;
+    /* Virtual device state is exclusively owned by the ALSA worker. */
+    size_t vdac_fill;
+    size_t vdac_capacity;
+    double vdac_phase;
+    uint32_t vdac_rate;
+    struct timespec vdac_prev_tick;
+    bool vdac_clock_running;
     diagnostics_t diag;
 
     int sock_fd;
@@ -231,6 +252,23 @@ static bool load_config(const char *path, receiver_ctx_t *ctx) {
             ctx->use_mmap_cfg = (atoi(val) != 0);
         } else if (strcasecmp(key, "DIAG") == 0) {
             ctx->diag_enabled = (atoi(val) != 0);
+        } else if (strcasecmp(key, "VDAC") == 0 || strcasecmp(key, "VIRTUAL_DAC") == 0) {
+            ctx->vdac_enabled = (atoi(val) != 0);
+        } else if (strcasecmp(key, "VDAC_RATE_PPM") == 0) {
+            int ppm = atoi(val);
+            if (ppm < -10000) ppm = -10000;
+            if (ppm > 10000) ppm = 10000;
+            ctx->vdac_rate_ppm = ppm;
+        } else if (strcasecmp(key, "VDAC_BUFFER_FRAMES") == 0) {
+            size_t frames = (size_t)strtoul(val, NULL, 10);
+            if (frames < 128) frames = 128;
+            if (frames > 262144) frames = 262144;
+            ctx->vdac_buffer_frames = frames;
+        } else if (strcasecmp(key, "VDAC_TICK_US") == 0) {
+            int tick = atoi(val);
+            if (tick < 250) tick = 250;
+            if (tick > 20000) tick = 20000;
+            ctx->vdac_tick_us = (unsigned int)tick;
         } else if (strcasecmp(key, "DIAG_INTERVAL_MS") == 0) {
             int interval = atoi(val);
             if (interval < 250) interval = 250;
@@ -294,6 +332,12 @@ static void diag_report(receiver_ctx_t *ctx, double seconds, double cpu_seconds,
     unsigned int feedback = diag_take(&d->feedback_sent);
     int ppm = __atomic_load_n(&d->last_feedback_ppm, __ATOMIC_RELAXED);
     int alsa_delay = __atomic_load_n(&d->last_alsa_delay_frames, __ATOMIC_RELAXED);
+    unsigned int vdac_consumed = diag_take(&d->vdac_frames_consumed);
+    unsigned int vdac_received = diag_take(&d->vdac_frames_accepted);
+    unsigned int vdac_underflows = diag_take(&d->vdac_underflow_events);
+    unsigned int vdac_missing = diag_take(&d->vdac_missing_frames);
+    unsigned int vdac_cap = __atomic_load_n(&d->vdac_capacity_frames, __ATOMIC_RELAXED);
+    unsigned int vdac_fill = __atomic_load_n(&d->vdac_fill_frames, __ATOMIC_RELAXED);
     size_t ring_now = ring_available(&ctx->ring);
     /* CPU process time is guest-side approximation, not physical RV1106 load. */
     printf("[DIAG] RX %.0f pkt/s %.1f KiB/s (payload %.1f, queued %.1f) "
@@ -306,10 +350,23 @@ static void diag_report(receiver_ctx_t *ctx, double seconds, double cpu_seconds,
     printf("(%.1f%%) drops=%u (%u B) flush=%u B rebuffer=%u\n",
            (double)ring_now * 100.0 / (double)RING_BUFFER_SIZE,
            drops, dropped_bytes, flush, rebuffer);
-    printf("[DIAG] ALSA frames/s=%.0f err=%u xrun=%u rw_unwritten=%u "
-           "delay=%d frames | fmt_ok=%u fmt_err=%u\n",
-           (double)frames / seconds, errors, xruns, lost_rw,
-           alsa_delay, resets, reset_fail);
+    if (ctx->vdac_enabled) {
+        printf("[DIAG] Backend=Virtual-DAC (ALSA bypassed) | fmt_ok=%u fmt_err=%u\n",
+               resets, reset_fail);
+    } else {
+        printf("[DIAG] ALSA frames/s=%.0f err=%u xrun=%u rw_unwritten=%u "
+               "delay=%d frames | fmt_ok=%u fmt_err=%u\n",
+               (double)frames / seconds, errors, xruns, lost_rw,
+               alsa_delay, resets, reset_fail);
+    }
+    if (ctx->vdac_enabled) {
+        printf("[VDAC] clock=%u Hz %+d ppm | FIFO=%u/%u frames (%.1f ms) "
+               "accepted/s=%.0f played/s=%.0f underflows=%u missing=%u frames\n",
+               ctx->vdac_rate, ctx->vdac_rate_ppm, vdac_fill, vdac_cap,
+               ctx->vdac_rate ? (double)vdac_fill * 1000.0 / ctx->vdac_rate : 0.0,
+               (double)vdac_received / seconds, (double)vdac_consumed / seconds,
+               vdac_underflows, vdac_missing);
+    }
     printf("[DIAG] PLL sent=%u last=%+d ppm | CPU(guest process)=%.1f%%\n",
            feedback, ppm, cpu_seconds / seconds * 100.0);
     fflush(stdout);
@@ -636,6 +693,128 @@ static bool reinit_alsa(receiver_ctx_t *ctx, const scream_format_t *fmt) {
     return true;
 }
 
+/* --- Virtual DAC clock (QEMU TEST ONLY) ---------------------------------
+ * This is an intentionally simplified timed sink: no I2S, no DMA, no actual
+ * ALSA samples, no DAC output and no bit-perfect validation. Frames taken
+ * from the ring are counted in a simulated hardware FIFO, drained using
+ * CLOCK_MONOTONIC at nominal_rate*(1+ppm/1e6). All state is owned by the
+ * ALSA/VDAC thread. No additional RT threads or ALSA calls in VDAC mode.
+ */
+static bool vdac_init(receiver_ctx_t *ctx, const scream_format_t *fmt) {
+    if (ctx->pcm_handle) {
+        snd_pcm_drop(ctx->pcm_handle);
+        snd_pcm_close(ctx->pcm_handle);
+        ctx->pcm_handle = NULL;
+    }
+    uint64_t rate = fmt->sample_rate;
+    if (fmt->is_dsd) rate *= (unsigned int)ctx->dsd_rate_mult;
+    if (!rate || rate > UINT32_MAX) return false;
+    ctx->vdac_rate = (uint32_t)rate;
+    ctx->vdac_capacity = ctx->vdac_buffer_frames;
+    ctx->vdac_fill = 0;
+    ctx->vdac_phase = 0.0;
+    ctx->vdac_clock_running = false;
+    __atomic_store_n(&ctx->diag.vdac_fill_frames, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->diag.vdac_capacity_frames, (unsigned int)ctx->vdac_capacity, __ATOMIC_RELAXED);
+    printf("[VDAC Config] %u Hz %+d ppm | FIFO=%zu frames (%.2f ms) | timed sink, no ALSA\n",
+           ctx->vdac_rate, ctx->vdac_rate_ppm, ctx->vdac_capacity,
+           (double)ctx->vdac_capacity * 1000.0 / ctx->vdac_rate);
+    return true;
+}
+
+static void vdac_fill_from_ring(receiver_ctx_t *ctx, size_t bpf) {
+    if (ctx->vdac_fill >= ctx->vdac_capacity) return;
+    size_t available_frames = ring_available(&ctx->ring) / bpf;
+    size_t space_frames = ctx->vdac_capacity - ctx->vdac_fill;
+    size_t transfer = available_frames < space_frames ? available_frames : space_frames;
+    if (transfer) {
+        ring_consume(&ctx->ring, transfer * bpf);
+        ctx->vdac_fill += transfer;
+        DIAG_ADD(ctx, vdac_frames_accepted, transfer);
+        __atomic_store_n(&ctx->diag.vdac_fill_frames, (unsigned int)ctx->vdac_fill, __ATOMIC_RELAXED);
+    }
+}
+
+static void vdac_start(receiver_ctx_t *ctx) {
+    clock_gettime(CLOCK_MONOTONIC, &ctx->vdac_prev_tick);
+    ctx->vdac_clock_running = true;
+    ctx->vdac_phase = 0.0;
+}
+
+/* Returns true if FIFO ran dry at a time when it should have been playing. */
+static bool vdac_drain_elapsed(receiver_ctx_t *ctx) {
+    if (!ctx->vdac_clock_running) return false;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return false;
+    double dt = timespec_sec(&now) - timespec_sec(&ctx->vdac_prev_tick);
+    ctx->vdac_prev_tick = now;
+    if (dt <= 0.0) return false;
+    double due = ctx->vdac_phase + dt * (double)ctx->vdac_rate *
+                 (1.0 + (double)ctx->vdac_rate_ppm / 1000000.0);
+    /* Account for long stalls without huge arithmetic or an endless catch-up. */
+    if (due > 1000000000.0) due = 1000000000.0;
+    size_t frames_due = (size_t)due;
+    ctx->vdac_phase = due - (double)frames_due;
+    if (!frames_due) return false;
+    size_t consumed = frames_due < ctx->vdac_fill ? frames_due : ctx->vdac_fill;
+    ctx->vdac_fill -= consumed;
+    DIAG_ADD(ctx, vdac_frames_consumed, consumed);
+    __atomic_store_n(&ctx->diag.vdac_fill_frames, (unsigned int)ctx->vdac_fill, __ATOMIC_RELAXED);
+    if (consumed < frames_due) {
+        size_t missing = frames_due - consumed;
+        DIAG_ADD(ctx, vdac_underflow_events, 1);
+        DIAG_ADD(ctx, vdac_missing_frames, missing);
+        ctx->vdac_clock_running = false;
+        ctx->vdac_phase = 0.0;
+        return true;
+    }
+    return false;
+}
+
+/* Transmit the original custom SCFB protocol. The host must actively apply
+ * corrections; this method is not compatible with standard Diretta control. */
+static void vdac_pll_feedback(receiver_ctx_t *ctx, double *ema, uint64_t *next_ns) {
+    if (!ctx->feedback_pll || !ctx->has_host_addr || !ctx->vdac_clock_running) return;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
+    uint64_t ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    if (ns < *next_ns) return;
+    *next_ns = ns + 100000000ULL; /* feedback every 100 ms, independent of tick */
+    /* Mirror the production feedback law: ALSA snd_pcm_delay() observes
+     * device-buffer occupancy, not the upstream application ring buffer. */
+    long observed = (long)ctx->vdac_fill;
+    *ema = (*ema < 0.0) ? (double)observed : (0.95 * *ema + 0.05 * (double)observed);
+    long target = (long)ctx->vdac_capacity / 2;
+    if (target < 1) target = 1;
+    long deadband = (long)ctx->vdac_capacity / 20; /* same 5% deadband as ALSA */
+    long error = (long)(*ema) - target;
+    int correction = 0;
+    if (error > deadband) {
+        correction = (int)(-((error - deadband) * 80 / target));
+        if (correction < -100) correction = -100;
+    } else if (error < -deadband) {
+        correction = (int)(-((error + deadband) * 80 / target));
+        if (correction > 100) correction = 100;
+    }
+    __atomic_store_n(&ctx->diag.last_feedback_ppm, correction, __ATOMIC_RELAXED);
+    /* Periodically send 0 as well, so a feedback-aware sender can reset. */
+    struct scream_feedback_pkt fb = { htonl(SCREAM_FEEDBACK_MAGIC), htonl(correction) };
+    ssize_t sent = -1;
+    if (ctx->mode == MODE_UDP) {
+        sent = sendto(ctx->sock_fd, &fb, sizeof(fb), MSG_DONTWAIT,
+                      (struct sockaddr *)&ctx->host_udp_addr, sizeof(ctx->host_udp_addr));
+    } else if (ctx->mode == MODE_L2) {
+        sent = sendto(ctx->sock_fd, &fb, sizeof(fb), MSG_DONTWAIT,
+                      (struct sockaddr *)&ctx->host_l2_addr, sizeof(ctx->host_l2_addr));
+    } else if (ctx->mode == MODE_TCP) {
+        pthread_mutex_lock(&ctx->tcp_mutex);
+        if (ctx->tcp_client_fd >= 0)
+            sent = send(ctx->tcp_client_fd, &fb, sizeof(fb), MSG_DONTWAIT | MSG_NOSIGNAL);
+        pthread_mutex_unlock(&ctx->tcp_mutex);
+    }
+    if (sent == (ssize_t)sizeof(fb)) DIAG_ADD(ctx, feedback_sent, 1);
+}
+
 /* --- TCP reassembly --- */
 
 static bool recv_exact_tcp(int fd, uint8_t *buf, size_t len, volatile bool *running) {
@@ -911,10 +1090,13 @@ static void *alsa_thread_fn(void *arg) {
     uint64_t loop_ticks = 0;
     size_t last_logged_drops = 0;
     double last_diag_delay_check = 0.0;
+    uint64_t vdac_next_feedback_ns = 0;
+    double vdac_ema = -1.0;
 
     while (ctx->running) {
         bool need_reinit = __atomic_load_n(&ctx->fmt_change_requested, __ATOMIC_ACQUIRE) ||
-                           (!ctx->pcm_handle && !__atomic_load_n(&ctx->fmt_failed, __ATOMIC_ACQUIRE) && ctx->fmt_initialized);
+                           (!ctx->vdac_enabled && !ctx->pcm_handle &&
+                            !__atomic_load_n(&ctx->fmt_failed, __ATOMIC_ACQUIRE) && ctx->fmt_initialized);
 
         if (need_reinit) {
             state = STATE_PREFILLING;
@@ -924,13 +1106,15 @@ static void *alsa_thread_fn(void *arg) {
                 __atomic_store_n(&ctx->diag.last_alsa_delay_frames, -1, __ATOMIC_RELAXED);
             ema_delay = 0.0;
             pll_ticks = 0;
+            vdac_next_feedback_ns = 0;
+            vdac_ema = -1.0;
 
             pthread_mutex_lock(&ctx->fmt_mutex);
             scream_format_t target = ctx->pending_fmt;
             uint32_t ver = ctx->fmt_version;
             pthread_mutex_unlock(&ctx->fmt_mutex);
 
-            if (!reinit_alsa(ctx, &target)) {
+            if (!(ctx->vdac_enabled ? vdac_init(ctx, &target) : reinit_alsa(ctx, &target))) {
                 DIAG_ADD(ctx, format_failures, 1);
                 __atomic_store_n(&ctx->fmt_failed, true, __ATOMIC_RELEASE);
                 pthread_mutex_lock(&ctx->fmt_mutex);
@@ -970,6 +1154,34 @@ static void *alsa_thread_fn(void *arg) {
         size_t preload_required = ctx->preload_frames * bpf;
         if (preload_required > (RING_BUFFER_SIZE / 2))
             preload_required = RING_BUFFER_SIZE / 4;
+
+        if (ctx->vdac_enabled) {
+            /* Virtual clock is the only consumer; ALSA is never opened here.
+             * FIFO must be filled before the timed clock starts. After start,
+             * an empty ring alone is NOT an underrun: FIFO can have data. */
+            if (state == STATE_PREFILLING) {
+                size_t required_frames = ctx->preload_frames;
+                if (required_frames > ctx->vdac_capacity) required_frames = ctx->vdac_capacity;
+                if (required_frames < 1) required_frames = 1;
+                if (avail / bpf >= required_frames) {
+                    vdac_fill_from_ring(ctx, bpf);
+                    vdac_start(ctx);
+                    state = STATE_PLAYING;
+                }
+            } else {
+                if (vdac_drain_elapsed(ctx)) {
+                    DIAG_ADD(ctx, rebuffer_events, 1);
+                    state = STATE_PREFILLING;
+                    ctx->vdac_fill = 0;
+                    __atomic_store_n(&ctx->diag.vdac_fill_frames, 0U, __ATOMIC_RELAXED);
+                } else {
+                    vdac_fill_from_ring(ctx, bpf);
+                    vdac_pll_feedback(ctx, &vdac_ema, &vdac_next_feedback_ns);
+                }
+            }
+            usleep(ctx->vdac_tick_us);
+            continue;
+        }
 
         if (state == STATE_PREFILLING) {
             if (avail < preload_required) {
@@ -1272,6 +1484,10 @@ int main(int argc, char *argv[]) {
     g_ctx.udp_busy_poll_us = 0; /* single-core: domyslnie OFF */
     g_ctx.diag_enabled = false; /* Avoid diagnostic overhead on target hardware. */
     g_ctx.diag_interval_ms = 1000;
+    g_ctx.vdac_enabled = false; /* Always OFF on the real RV1106 by default. */
+    g_ctx.vdac_rate_ppm = 0;
+    g_ctx.vdac_buffer_frames = VDAC_DEFAULT_CAPACITY;
+    g_ctx.vdac_tick_us = VDAC_DEFAULT_TICK_US;
     g_ctx.diag.last_alsa_delay_frames = -1;
     g_ctx.tcp_client_fd = -1;
     g_ctx.running = true;
@@ -1385,6 +1601,11 @@ int main(int argc, char *argv[]) {
                g_ctx.udp_busy_poll_us);
     }
 
+    if (g_ctx.vdac_enabled) {
+        printf("[VDAC] TEST-ONLY virtual clock enabled; ALSA/I2S is bypassed. drift=%+d ppm\n",
+               g_ctx.vdac_rate_ppm);
+        fflush(stdout);
+    }
     if (g_ctx.diag_enabled) {
         printf("[DIAG] Wlaczono diagnostyke co %u ms; ring min/max probkowany co 100 ms.\n",
                g_ctx.diag_interval_ms);
