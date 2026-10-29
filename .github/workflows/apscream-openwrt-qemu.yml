@@ -1,4 +1,4 @@
-name: Build APScream IPK for OpenWrt 24.10.8 QEMU
+name: Build APScream IPK for OpenWrt 24.10.8 QEMU (RT fix)
 
 on:
   workflow_dispatch:
@@ -11,6 +11,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 65
     steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
       - name: Install SDK build dependencies
         run: |
           sudo apt-get update
@@ -29,30 +32,16 @@ jobs:
           mkdir sdk
           tar --zstd -xf "$FILE" -C sdk --strip-components=1
 
-      - name: Fetch pinned APScream source and fix ALSA null pointers
+      - name: Use APScream source from this Git commit
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p sdk/package/apscream-open/src
-          curl -fL --retry 3 \
-            https://raw.githubusercontent.com/bart594/MultiSync-I2S/4611e49b22e65040dfddf9c5a23b032e788b1626/ext_tree/package/apscream-open/apscream_open.c \
-            -o sdk/package/apscream-open/src/apscream_open.c
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('sdk/package/apscream-open/src/apscream_open.c')
-          s=p.read_text()
-          fixes={
-              'snd_pcm_get_params(ctx->pcm_handle, &buf_frames, NULL);':
-                  'snd_pcm_uframes_t warmup_period = 0;\n    snd_pcm_get_params(ctx->pcm_handle, &buf_frames, &warmup_period);',
-              'snd_pcm_get_params(ctx->pcm_handle, &buf_size, NULL);':
-                  'snd_pcm_uframes_t pll_period = 0;\n                    snd_pcm_get_params(ctx->pcm_handle, &buf_size, &pll_period);',
-          }
-          for old,new in fixes.items():
-              assert s.count(old) == 1, f'Nieoczekiwana zmiana zrodla: {old}'
-              s=s.replace(old,new)
-          p.write_text(s)
-          print('Dwie poprawki snd_pcm_get_params zastosowane')
-          PY
+          cp ext_tree/package/apscream-open/apscream_open.c \
+            sdk/package/apscream-open/src/apscream_open.c
+          grep -q 'ALSA_IDLE_SLEEP_US' sdk/package/apscream-open/src/apscream_open.c
+          ! grep -q 'snd_pcm_get_params(.*NULL' sdk/package/apscream-open/src/apscream_open.c
+          echo 'APScream from checkout with RT idle fix and ALSA fixes'
 
       - name: Write OpenWrt package definition
         shell: bash
@@ -62,7 +51,7 @@ jobs:
 
           PKG_NAME:=apscream-open
           PKG_VERSION:=3.2
-          PKG_RELEASE:=1
+          PKG_RELEASE:=2
           PKG_LICENSE:=UNKNOWN
           PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 
