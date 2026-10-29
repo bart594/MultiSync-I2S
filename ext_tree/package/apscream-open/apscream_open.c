@@ -25,7 +25,7 @@
 #include <linux/if_ether.h>
 #include <alsa/asoundlib.h>
 
-#define AP_VERSION "3.4-VIRTUAL-DAC-RV1106"
+#define AP_VERSION "3.5-PI-RESYNC-RV1106"
 
 #define MAX_PACKET_SIZE       9216
 #define RING_BUFFER_SIZE      (4 * 1024 * 1024)
@@ -41,6 +41,28 @@
 /* Virtual DAC is a test-only clock model, NEVER a physical I2S emulator. */
 #define VDAC_DEFAULT_CAPACITY 8192
 #define VDAC_DEFAULT_TICK_US 1000
+#define VDAC_DEFAULT_KP 0.40  /* ppm per frame of smoothed FIFO error */
+#define VDAC_DEFAULT_KI 0.006 /* ppm per frame-second of FIFO error */
+#define VDAC_MAX_CORRECTION_PPM 100
+#define VDAC_RX_IDLE_MS 150
+
+/* Only affects test-only VDAC; hardware ALSA/MMAP feedback is unchanged. */
+typedef enum {
+    VDAC_PREFILL = 0, VDAC_LOCKED, VDAC_WARNING, VDAC_RESYNC,
+    VDAC_FAULT, VDAC_IDLE
+} vdac_status_t;
+
+static const char *vdac_status_name(unsigned int status) {
+    switch (status) {
+    case VDAC_PREFILL: return "PREFILL";
+    case VDAC_LOCKED: return "LOCKED";
+    case VDAC_WARNING: return "WARNING";
+    case VDAC_RESYNC: return "RESYNC";
+    case VDAC_FAULT: return "FAULT";
+    case VDAC_IDLE: return "IDLE";
+    default: return "UNKNOWN";
+    }
+}
 
 typedef enum {
     MODE_UDP,
@@ -102,6 +124,12 @@ typedef struct {
     unsigned int vdac_capacity_frames; /* atomic snapshot, not exchange */
     unsigned int vdac_fill_frames;     /* atomic snapshot, not exchange */
     unsigned int feedback_sent;
+    unsigned int vdac_resync_events;
+    unsigned int vdac_warning_events;
+    unsigned int vdac_fault_events;
+    unsigned int vdac_sync_state;
+    int vdac_pi_p_milli;  /* milli-ppm, atomic snapshot */
+    int vdac_pi_i_milli;
     int last_feedback_ppm;
     int last_alsa_delay_frames;
 } diagnostics_t;
@@ -131,6 +159,19 @@ typedef struct {
     int vdac_rate_ppm;
     size_t vdac_buffer_frames;
     unsigned int vdac_tick_us;
+    bool vdac_pi_enabled;
+    double vdac_kp;
+    double vdac_ki;
+    int vdac_max_correction_ppm;
+    unsigned int vdac_warn_hold_ms;
+    unsigned int vdac_resync_hold_ms;
+    unsigned int vdac_resync_limit;
+    unsigned int vdac_resync_window_s;
+    char vdac_csv_path[256];
+    FILE *vdac_csv_file; /* only main thread writes */
+    double vdac_log_elapsed;
+    volatile unsigned int vdac_last_rx_ms;
+    volatile bool vdac_eot;
     /* Virtual device state is exclusively owned by the ALSA worker. */
     size_t vdac_fill;
     size_t vdac_capacity;
@@ -138,6 +179,15 @@ typedef struct {
     uint32_t vdac_rate;
     struct timespec vdac_prev_tick;
     bool vdac_clock_running;
+    vdac_status_t vdac_status;
+    double vdac_ema;
+    double vdac_integral;
+    uint64_t vdac_last_pi_ns;
+    uint64_t vdac_sat_start_ns;
+    uint64_t vdac_extreme_start_ns;
+    uint64_t vdac_warn_start_ns;
+    uint64_t vdac_resync_window_start_ns;
+    unsigned int vdac_resync_window_count;
     diagnostics_t diag;
 
     int sock_fd;
@@ -176,6 +226,16 @@ static receiver_ctx_t g_ctx;
 
 static inline unsigned int diag_take(unsigned int *value) {
     return __atomic_exchange_n(value, 0U, __ATOMIC_RELAXED);
+}
+
+static uint64_t monotonic_ns(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
+    return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
+}
+
+static unsigned int monotonic_ms32(void) {
+    return (unsigned int)(monotonic_ns() / 1000000ULL);
 }
 
 static double timespec_sec(const struct timespec *t) {
@@ -259,6 +319,32 @@ static bool load_config(const char *path, receiver_ctx_t *ctx) {
             if (ppm < -10000) ppm = -10000;
             if (ppm > 10000) ppm = 10000;
             ctx->vdac_rate_ppm = ppm;
+        } else if (strcasecmp(key, "VDAC_PI") == 0) {
+            ctx->vdac_pi_enabled = (atoi(val) != 0);
+        } else if (strcasecmp(key, "VDAC_PI_KP") == 0) {
+            double v = atof(val);
+            if (v >= 0.0 && v <= 5.0) ctx->vdac_kp = v;
+        } else if (strcasecmp(key, "VDAC_PI_KI") == 0) {
+            double v = atof(val);
+            if (v >= 0.0 && v <= 0.1) ctx->vdac_ki = v;
+        } else if (strcasecmp(key, "VDAC_PLL_MAX_PPM") == 0) {
+            int v = atoi(val);
+            if (v >= 1 && v <= VDAC_MAX_CORRECTION_PPM)
+                ctx->vdac_max_correction_ppm = v;
+        } else if (strcasecmp(key, "VDAC_WARN_HOLD_MS") == 0) {
+            int v = atoi(val);
+            if (v >= 1000 && v <= 120000) ctx->vdac_warn_hold_ms = (unsigned int)v;
+        } else if (strcasecmp(key, "VDAC_RESYNC_HOLD_MS") == 0) {
+            int v = atoi(val);
+            if (v >= 100 && v <= 5000) ctx->vdac_resync_hold_ms = (unsigned int)v;
+        } else if (strcasecmp(key, "VDAC_RESYNC_LIMIT") == 0) {
+            int v = atoi(val);
+            if (v >= 1 && v <= 20) ctx->vdac_resync_limit = (unsigned int)v;
+        } else if (strcasecmp(key, "VDAC_RESYNC_WINDOW_S") == 0) {
+            int v = atoi(val);
+            if (v >= 10 && v <= 3600) ctx->vdac_resync_window_s = (unsigned int)v;
+        } else if (strcasecmp(key, "VDAC_CSV_PATH") == 0) {
+            snprintf(ctx->vdac_csv_path, sizeof(ctx->vdac_csv_path), "%s", val);
         } else if (strcasecmp(key, "VDAC_BUFFER_FRAMES") == 0) {
             size_t frames = (size_t)strtoul(val, NULL, 10);
             if (frames < 128) frames = 128;
@@ -338,6 +424,13 @@ static void diag_report(receiver_ctx_t *ctx, double seconds, double cpu_seconds,
     unsigned int vdac_missing = diag_take(&d->vdac_missing_frames);
     unsigned int vdac_cap = __atomic_load_n(&d->vdac_capacity_frames, __ATOMIC_RELAXED);
     unsigned int vdac_fill = __atomic_load_n(&d->vdac_fill_frames, __ATOMIC_RELAXED);
+    unsigned int vdac_rate = __atomic_load_n(&ctx->vdac_rate, __ATOMIC_RELAXED);
+    unsigned int vdac_state = __atomic_load_n(&d->vdac_sync_state, __ATOMIC_RELAXED);
+    int vdac_p_milli = __atomic_load_n(&d->vdac_pi_p_milli, __ATOMIC_RELAXED);
+    int vdac_i_milli = __atomic_load_n(&d->vdac_pi_i_milli, __ATOMIC_RELAXED);
+    unsigned int vdac_resyncs = diag_take(&d->vdac_resync_events);
+    unsigned int vdac_warns = diag_take(&d->vdac_warning_events);
+    unsigned int vdac_faults = diag_take(&d->vdac_fault_events);
     size_t ring_now = ring_available(&ctx->ring);
     /* CPU process time is guest-side approximation, not physical RV1106 load. */
     printf("[DIAG] RX %.0f pkt/s %.1f KiB/s (payload %.1f, queued %.1f) "
@@ -362,10 +455,27 @@ static void diag_report(receiver_ctx_t *ctx, double seconds, double cpu_seconds,
     if (ctx->vdac_enabled) {
         printf("[VDAC] clock=%u Hz %+d ppm | FIFO=%u/%u frames (%.1f ms) "
                "accepted/s=%.0f played/s=%.0f underflows=%u missing=%u frames\n",
-               ctx->vdac_rate, ctx->vdac_rate_ppm, vdac_fill, vdac_cap,
-               ctx->vdac_rate ? (double)vdac_fill * 1000.0 / ctx->vdac_rate : 0.0,
+               vdac_rate, ctx->vdac_rate_ppm, vdac_fill, vdac_cap,
+               vdac_rate ? (double)vdac_fill * 1000.0 / vdac_rate : 0.0,
                (double)vdac_received / seconds, (double)vdac_consumed / seconds,
                vdac_underflows, vdac_missing);
+        printf("[VDAC CTRL] state=%s P=%+.3f I=%+.3f ppm request=%+d ppm "
+               "feedback=%s warn=%u resync=%u fault=%u\n",
+               vdac_status_name(vdac_state), vdac_p_milli / 1000.0,
+               vdac_i_milli / 1000.0, ppm,
+               ctx->feedback_pll ? "on" : "off", vdac_warns, vdac_resyncs,
+               vdac_faults);
+        if (ctx->vdac_csv_file) {
+            ctx->vdac_log_elapsed += seconds;
+            fprintf(ctx->vdac_csv_file,
+                    "%.3f,%u,%u,%u,%s,%d,%.3f,%.3f,%.0f,%.0f,%u,%u,%u,%u,%u\n",
+                    ctx->vdac_log_elapsed, vdac_rate, vdac_fill, vdac_cap,
+                    vdac_status_name(vdac_state), ppm, vdac_p_milli / 1000.0,
+                    vdac_i_milli / 1000.0, (double)pkts / seconds,
+                    (double)vdac_consumed / seconds, vdac_underflows,
+                    vdac_missing, vdac_warns, vdac_resyncs, vdac_faults);
+            fflush(ctx->vdac_csv_file);
+        }
     }
     printf("[DIAG] PLL sent=%u last=%+d ppm | CPU(guest process)=%.1f%%\n",
            feedback, ppm, cpu_seconds / seconds * 100.0);
@@ -709,11 +819,25 @@ static bool vdac_init(receiver_ctx_t *ctx, const scream_format_t *fmt) {
     uint64_t rate = fmt->sample_rate;
     if (fmt->is_dsd) rate *= (unsigned int)ctx->dsd_rate_mult;
     if (!rate || rate > UINT32_MAX) return false;
-    ctx->vdac_rate = (uint32_t)rate;
+    __atomic_store_n(&ctx->vdac_rate, (uint32_t)rate, __ATOMIC_RELAXED);
     ctx->vdac_capacity = ctx->vdac_buffer_frames;
     ctx->vdac_fill = 0;
     ctx->vdac_phase = 0.0;
     ctx->vdac_clock_running = false;
+    ctx->vdac_ema = -1.0;
+    ctx->vdac_integral = 0.0;
+    ctx->vdac_last_pi_ns = 0;
+    ctx->vdac_sat_start_ns = 0;
+    ctx->vdac_extreme_start_ns = 0;
+    ctx->vdac_warn_start_ns = 0;
+    ctx->vdac_resync_window_start_ns = 0;
+    ctx->vdac_resync_window_count = 0;
+    ctx->vdac_status = VDAC_PREFILL;
+    __atomic_store_n(&ctx->diag.vdac_sync_state, VDAC_PREFILL, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->diag.vdac_pi_p_milli, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->diag.vdac_pi_i_milli, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->diag.last_feedback_ppm, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->vdac_eot, false, __ATOMIC_RELEASE);
     __atomic_store_n(&ctx->diag.vdac_fill_frames, 0U, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->diag.vdac_capacity_frames, (unsigned int)ctx->vdac_capacity, __ATOMIC_RELAXED);
     printf("[VDAC Config] %u Hz %+d ppm | FIFO=%zu frames (%.2f ms) | timed sink, no ALSA\n",
@@ -735,11 +859,33 @@ static void vdac_fill_from_ring(receiver_ctx_t *ctx, size_t bpf) {
     }
 }
 
+static void vdac_set_status(receiver_ctx_t *ctx, vdac_status_t status) {
+    if (ctx->vdac_status == status) return;
+    ctx->vdac_status = status;
+    __atomic_store_n(&ctx->diag.vdac_sync_state, (unsigned int)status, __ATOMIC_RELAXED);
+}
+
+static void vdac_reset_controller(receiver_ctx_t *ctx) {
+    ctx->vdac_ema = -1.0;
+    ctx->vdac_integral = 0.0;
+    ctx->vdac_last_pi_ns = 0;
+    ctx->vdac_sat_start_ns = 0;
+    ctx->vdac_warn_start_ns = 0;
+    ctx->vdac_extreme_start_ns = 0;
+    __atomic_store_n(&ctx->diag.vdac_pi_p_milli, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->diag.vdac_pi_i_milli, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->diag.last_feedback_ppm, 0, __ATOMIC_RELAXED);
+}
+
 static void vdac_start(receiver_ctx_t *ctx) {
     clock_gettime(CLOCK_MONOTONIC, &ctx->vdac_prev_tick);
     ctx->vdac_clock_running = true;
     ctx->vdac_phase = 0.0;
+    vdac_reset_controller(ctx);
+    vdac_set_status(ctx, VDAC_LOCKED);
 }
+
+static bool vdac_stream_recent(receiver_ctx_t *ctx);
 
 /* Returns true if FIFO ran dry at a time when it should have been playing. */
 static bool vdac_drain_elapsed(receiver_ctx_t *ctx) {
@@ -762,8 +908,11 @@ static bool vdac_drain_elapsed(receiver_ctx_t *ctx) {
     __atomic_store_n(&ctx->diag.vdac_fill_frames, (unsigned int)ctx->vdac_fill, __ATOMIC_RELAXED);
     if (consumed < frames_due) {
         size_t missing = frames_due - consumed;
-        DIAG_ADD(ctx, vdac_underflow_events, 1);
-        DIAG_ADD(ctx, vdac_missing_frames, missing);
+        /* Do not count natural EOT/idle FIFO exhaustion as a clock fault. */
+        if (vdac_stream_recent(ctx)) {
+            DIAG_ADD(ctx, vdac_underflow_events, 1);
+            DIAG_ADD(ctx, vdac_missing_frames, missing);
+        }
         ctx->vdac_clock_running = false;
         ctx->vdac_phase = 0.0;
         return true;
@@ -771,33 +920,10 @@ static bool vdac_drain_elapsed(receiver_ctx_t *ctx) {
     return false;
 }
 
-/* Transmit the original custom SCFB protocol. The host must actively apply
- * corrections; this method is not compatible with standard Diretta control. */
-static void vdac_pll_feedback(receiver_ctx_t *ctx, double *ema, uint64_t *next_ns) {
-    if (!ctx->feedback_pll || !ctx->has_host_addr || !ctx->vdac_clock_running) return;
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
-    uint64_t ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
-    if (ns < *next_ns) return;
-    *next_ns = ns + 100000000ULL; /* feedback every 100 ms, independent of tick */
-    /* Mirror the production feedback law: ALSA snd_pcm_delay() observes
-     * device-buffer occupancy, not the upstream application ring buffer. */
-    long observed = (long)ctx->vdac_fill;
-    *ema = (*ema < 0.0) ? (double)observed : (0.95 * *ema + 0.05 * (double)observed);
-    long target = (long)ctx->vdac_capacity / 2;
-    if (target < 1) target = 1;
-    long deadband = (long)ctx->vdac_capacity / 20; /* same 5% deadband as ALSA */
-    long error = (long)(*ema) - target;
-    int correction = 0;
-    if (error > deadband) {
-        correction = (int)(-((error - deadband) * 80 / target));
-        if (correction < -100) correction = -100;
-    } else if (error < -deadband) {
-        correction = (int)(-((error + deadband) * 80 / target));
-        if (correction > 100) correction = 100;
-    }
-    __atomic_store_n(&ctx->diag.last_feedback_ppm, correction, __ATOMIC_RELAXED);
-    /* Periodically send 0 as well, so a feedback-aware sender can reset. */
+/* SCFB is a custom APScream test protocol, NOT the Diretta protocol.
+ * Positive correction means send FASTER; exactly how vdac_sender.py applies it. */
+static void vdac_send_feedback(receiver_ctx_t *ctx, int correction) {
+    if (!ctx->feedback_pll || !ctx->has_host_addr) return;
     struct scream_feedback_pkt fb = { htonl(SCREAM_FEEDBACK_MAGIC), htonl(correction) };
     ssize_t sent = -1;
     if (ctx->mode == MODE_UDP) {
@@ -813,6 +939,144 @@ static void vdac_pll_feedback(receiver_ctx_t *ctx, double *ema, uint64_t *next_n
         pthread_mutex_unlock(&ctx->tcp_mutex);
     }
     if (sent == (ssize_t)sizeof(fb)) DIAG_ADD(ctx, feedback_sent, 1);
+}
+
+/* After a stopped sender, a DAC FIFO will eventually run empty. This is NOT
+ * evidence of clock divergence. Explicit Scream end-of-track is preferred. */
+static bool vdac_stream_recent(receiver_ctx_t *ctx) {
+    if (__atomic_load_n(&ctx->vdac_eot, __ATOMIC_ACQUIRE)) return false;
+    unsigned int last_ms = __atomic_load_n(&ctx->vdac_last_rx_ms, __ATOMIC_RELAXED);
+    return last_ms != 0 &&
+           (unsigned int)(monotonic_ms32() - last_ms) < VDAC_RX_IDLE_MS;
+}
+
+/* TEST-ONLY stop/re-prefill: drop FIFO and ring, NOT network socket or ALSA.
+ * A repeated resync means that clocks or transport cannot be synchronized. */
+static void vdac_stop_and_prefill(receiver_ctx_t *ctx, playback_state_t *play,
+                                  bool abnormal, const char *reason) {
+    ctx->vdac_clock_running = false;
+    ctx->vdac_fill = 0;
+    ctx->vdac_phase = 0.0;
+    __atomic_store_n(&ctx->diag.vdac_fill_frames, 0U, __ATOMIC_RELAXED);
+    ring_clear_consumer(&ctx->ring);
+    *play = STATE_PREFILLING;
+    vdac_reset_controller(ctx);
+    vdac_send_feedback(ctx, 0); /* Release old correction held by sender. */
+    if (!abnormal) {
+        vdac_set_status(ctx, VDAC_IDLE);
+        printf("[VDAC] IDLE: %s; waiting for new stream, no fault counted\n", reason);
+        return;
+    }
+    uint64_t now = monotonic_ns();
+    if (!ctx->vdac_resync_window_start_ns ||
+        now - ctx->vdac_resync_window_start_ns >
+            (uint64_t)ctx->vdac_resync_window_s * 1000000000ULL) {
+        ctx->vdac_resync_window_start_ns = now;
+        ctx->vdac_resync_window_count = 0;
+    }
+    ++ctx->vdac_resync_window_count;
+    DIAG_ADD(ctx, vdac_resync_events, 1);
+    vdac_set_status(ctx, VDAC_RESYNC);
+    printf("[VDAC] RESYNC: %s (%u/%u in %u s), flush and prefill\n",
+           reason, ctx->vdac_resync_window_count, ctx->vdac_resync_limit,
+           ctx->vdac_resync_window_s);
+    if (ctx->vdac_resync_window_count >= ctx->vdac_resync_limit) {
+        vdac_set_status(ctx, VDAC_FAULT);
+        DIAG_ADD(ctx, vdac_fault_events, 1);
+        printf("[VDAC] FAULT: repeated resync; playback disabled until process restart\n");
+    }
+}
+
+/* Controller runs every 100 ms; all controller and FIFO state is owned by
+ * one worker. Conditional integration prevents PI wind-up on saturation. */
+static int vdac_pi_step(receiver_ctx_t *ctx, uint64_t now_ns) {
+    const double measured = (double)ctx->vdac_fill;
+    ctx->vdac_ema = (ctx->vdac_ema < 0.0) ? measured
+                   : (0.85 * ctx->vdac_ema + 0.15 * measured);
+    const double target = (double)ctx->vdac_capacity * 0.5;
+    const double error = target - ctx->vdac_ema;
+    const double limit = (double)ctx->vdac_max_correction_ppm;
+    const double p = ctx->vdac_kp * error;
+    double dt = ctx->vdac_last_pi_ns ?
+        (double)(now_ns - ctx->vdac_last_pi_ns) / 1000000000.0 : 0.0;
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.25) dt = 0.25; /* no integral burst after a QEMU pause */
+    ctx->vdac_last_pi_ns = now_ns;
+    if (ctx->vdac_pi_enabled) {
+        double candidate = ctx->vdac_integral + ctx->vdac_ki * error * dt;
+        if (candidate > limit) candidate = limit;
+        if (candidate < -limit) candidate = -limit;
+        /* Do not integrate further into a saturated output; allow unwinding. */
+        if (!((p + candidate > limit && error > 0.0) ||
+              (p + candidate < -limit && error < 0.0)))
+            ctx->vdac_integral = candidate;
+    } else {
+        ctx->vdac_integral = 0.0;
+    }
+    double output = p + ctx->vdac_integral;
+    if (output > limit) output = limit;
+    if (output < -limit) output = -limit;
+    const int correction = (int)(output >= 0.0 ? output + 0.5 : output - 0.5);
+    __atomic_store_n(&ctx->diag.vdac_pi_p_milli,
+                     (int)(p * 1000.0), __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->diag.vdac_pi_i_milli,
+                     (int)(ctx->vdac_integral * 1000.0), __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->diag.last_feedback_ppm, correction, __ATOMIC_RELAXED);
+    return correction;
+}
+
+/* Warn only after sustained limit or sustained FIFO deviation. Resync only
+ * when FIFO is critically near empty/full for a hold interval; an abrupt
+ * packet burst or a brief scheduling hiccup cannot trigger it immediately. */
+static bool vdac_check_sync(receiver_ctx_t *ctx, playback_state_t *play,
+                            int correction, uint64_t now_ns) {
+    if (ctx->vdac_status == VDAC_FAULT) return true;
+    if (!vdac_stream_recent(ctx)) {
+        ctx->vdac_sat_start_ns = 0;
+        ctx->vdac_warn_start_ns = 0;
+        ctx->vdac_extreme_start_ns = 0;
+        return false;
+    }
+    double fraction = (double)ctx->vdac_fill / (double)ctx->vdac_capacity;
+    const bool extreme = fraction < 0.10 || fraction > 0.90;
+    const bool outside = fraction < 0.20 || fraction > 0.80;
+    const bool saturated = correction >= ctx->vdac_max_correction_ppm ||
+                           correction <= -ctx->vdac_max_correction_ppm;
+    if (extreme) {
+        if (!ctx->vdac_extreme_start_ns) ctx->vdac_extreme_start_ns = now_ns;
+        else if (now_ns - ctx->vdac_extreme_start_ns >=
+                 (uint64_t)ctx->vdac_resync_hold_ms * 1000000ULL) {
+            vdac_stop_and_prefill(ctx, play, true, "critical FIFO <10% or >90%");
+            return true;
+        }
+    } else ctx->vdac_extreme_start_ns = 0;
+    if (outside || saturated) {
+        if (!ctx->vdac_warn_start_ns) ctx->vdac_warn_start_ns = now_ns;
+        if (now_ns - ctx->vdac_warn_start_ns >=
+            (uint64_t)ctx->vdac_warn_hold_ms * 1000000ULL &&
+            ctx->vdac_status != VDAC_WARNING) {
+            vdac_set_status(ctx, VDAC_WARNING);
+            DIAG_ADD(ctx, vdac_warning_events, 1);
+            printf("[VDAC] WARNING: persistent FIFO deviation or PI at limit; "
+                   "fill=%zu/%zu feedback=%+d ppm\n",
+                   ctx->vdac_fill, ctx->vdac_capacity, correction);
+        }
+    } else {
+        ctx->vdac_warn_start_ns = 0;
+        vdac_set_status(ctx, VDAC_LOCKED);
+    }
+    return false;
+}
+
+static void vdac_pll_feedback(receiver_ctx_t *ctx, uint64_t *next_ns,
+                              playback_state_t *play) {
+    if (!ctx->vdac_clock_running || ctx->vdac_status == VDAC_FAULT) return;
+    uint64_t ns = monotonic_ns();
+    if (ns < *next_ns) return;
+    *next_ns = ns + 100000000ULL; /* sample controller every 100 ms */
+    int correction = vdac_pi_step(ctx, ns);
+    if (vdac_check_sync(ctx, play, correction, ns)) return;
+    if (ctx->feedback_pll) vdac_send_feedback(ctx, correction);
 }
 
 /* --- TCP reassembly --- */
@@ -925,6 +1189,8 @@ static void *network_thread_fn(void *arg) {
 
         if (fmt.end_of_track) {
             printf("[STREAM] Odebrano znacznik konca utworu (end_of_track).\n");
+            if (ctx->vdac_enabled)
+                __atomic_store_n(&ctx->vdac_eot, true, __ATOMIC_RELEASE);
         }
 
         pthread_mutex_lock(&ctx->fmt_mutex);
@@ -960,6 +1226,11 @@ static void *network_thread_fn(void *arg) {
         }
 
         if (ring_push(&ctx->ring, audio_payload, audio_len)) {
+            if (ctx->vdac_enabled) {
+                __atomic_store_n(&ctx->vdac_last_rx_ms, monotonic_ms32(), __ATOMIC_RELAXED);
+                if (!fmt.end_of_track)
+                    __atomic_store_n(&ctx->vdac_eot, false, __ATOMIC_RELEASE);
+            }
             DIAG_ADD(ctx, queued_audio_bytes, audio_len);
         } else {
             DIAG_ADD(ctx, ring_drop_packets, 1);
@@ -1091,9 +1362,14 @@ static void *alsa_thread_fn(void *arg) {
     size_t last_logged_drops = 0;
     double last_diag_delay_check = 0.0;
     uint64_t vdac_next_feedback_ns = 0;
-    double vdac_ema = -1.0;
 
     while (ctx->running) {
+        /* A repeated clock/transport fault is sticky until explicit restart,
+         * even if the sender announces a new sample format. */
+        if (ctx->vdac_enabled && ctx->vdac_status == VDAC_FAULT) {
+            usleep(10000);
+            continue;
+        }
         bool need_reinit = __atomic_load_n(&ctx->fmt_change_requested, __ATOMIC_ACQUIRE) ||
                            (!ctx->vdac_enabled && !ctx->pcm_handle &&
                             !__atomic_load_n(&ctx->fmt_failed, __ATOMIC_ACQUIRE) && ctx->fmt_initialized);
@@ -1107,7 +1383,6 @@ static void *alsa_thread_fn(void *arg) {
             ema_delay = 0.0;
             pll_ticks = 0;
             vdac_next_feedback_ns = 0;
-            vdac_ema = -1.0;
 
             pthread_mutex_lock(&ctx->fmt_mutex);
             scream_format_t target = ctx->pending_fmt;
@@ -1156,9 +1431,12 @@ static void *alsa_thread_fn(void *arg) {
             preload_required = RING_BUFFER_SIZE / 4;
 
         if (ctx->vdac_enabled) {
-            /* Virtual clock is the only consumer; ALSA is never opened here.
-             * FIFO must be filled before the timed clock starts. After start,
-             * an empty ring alone is NOT an underrun: FIFO can have data. */
+            /* This sink never opens ALSA. FAULT prevents repeated resets; a
+             * process restart is an explicit recovery action by the operator. */
+            if (ctx->vdac_status == VDAC_FAULT) {
+                usleep(10000);
+                continue;
+            }
             if (state == STATE_PREFILLING) {
                 size_t required_frames = ctx->preload_frames;
                 if (required_frames > ctx->vdac_capacity) required_frames = ctx->vdac_capacity;
@@ -1166,17 +1444,18 @@ static void *alsa_thread_fn(void *arg) {
                 if (avail / bpf >= required_frames) {
                     vdac_fill_from_ring(ctx, bpf);
                     vdac_start(ctx);
+                    vdac_next_feedback_ns = 0;
                     state = STATE_PLAYING;
                 }
             } else {
                 if (vdac_drain_elapsed(ctx)) {
-                    DIAG_ADD(ctx, rebuffer_events, 1);
-                    state = STATE_PREFILLING;
-                    ctx->vdac_fill = 0;
-                    __atomic_store_n(&ctx->diag.vdac_fill_frames, 0U, __ATOMIC_RELAXED);
+                    bool active = vdac_stream_recent(ctx);
+                    if (active) DIAG_ADD(ctx, rebuffer_events, 1);
+                    vdac_stop_and_prefill(ctx, &state, active,
+                                          active ? "FIFO underflow" : "sender stopped / EOT");
                 } else {
                     vdac_fill_from_ring(ctx, bpf);
-                    vdac_pll_feedback(ctx, &vdac_ema, &vdac_next_feedback_ns);
+                    vdac_pll_feedback(ctx, &vdac_next_feedback_ns, &state);
                 }
             }
             usleep(ctx->vdac_tick_us);
@@ -1488,6 +1767,14 @@ int main(int argc, char *argv[]) {
     g_ctx.vdac_rate_ppm = 0;
     g_ctx.vdac_buffer_frames = VDAC_DEFAULT_CAPACITY;
     g_ctx.vdac_tick_us = VDAC_DEFAULT_TICK_US;
+    g_ctx.vdac_pi_enabled = true;
+    g_ctx.vdac_kp = VDAC_DEFAULT_KP;
+    g_ctx.vdac_ki = VDAC_DEFAULT_KI;
+    g_ctx.vdac_max_correction_ppm = VDAC_MAX_CORRECTION_PPM;
+    g_ctx.vdac_warn_hold_ms = 15000;
+    g_ctx.vdac_resync_hold_ms = 750;
+    g_ctx.vdac_resync_limit = 3;
+    g_ctx.vdac_resync_window_s = 600;
     g_ctx.diag.last_alsa_delay_frames = -1;
     g_ctx.tcp_client_fd = -1;
     g_ctx.running = true;
@@ -1602,8 +1889,24 @@ int main(int argc, char *argv[]) {
     }
 
     if (g_ctx.vdac_enabled) {
-        printf("[VDAC] TEST-ONLY virtual clock enabled; ALSA/I2S is bypassed. drift=%+d ppm\n",
-               g_ctx.vdac_rate_ppm);
+        printf("[VDAC] TEST-ONLY clock enabled; drift=%+d ppm, PI=%d "
+               "kp=%.3f ki=%.4f max=+/- %d ppm, ALSA bypassed\n",
+               g_ctx.vdac_rate_ppm, g_ctx.vdac_pi_enabled,
+               g_ctx.vdac_kp, g_ctx.vdac_ki, g_ctx.vdac_max_correction_ppm);
+        if (g_ctx.diag_enabled && g_ctx.vdac_csv_path[0]) {
+            g_ctx.vdac_csv_file = fopen(g_ctx.vdac_csv_path, "w");
+            if (!g_ctx.vdac_csv_file)
+                fprintf(stderr, "[VDAC] Cannot open CSV '%s': %s\n",
+                        g_ctx.vdac_csv_path, strerror(errno));
+            else {
+                fprintf(g_ctx.vdac_csv_file,
+                        "elapsed_s,rate_hz,fifo_frames,fifo_capacity,state,"
+                        "requested_ppm,p_ppm,i_ppm,rx_pkt_s,played_frames_s,"
+                        "underflows,missing_frames,warnings,resyncs,faults\n");
+                fflush(g_ctx.vdac_csv_file);
+                printf("[VDAC] CSV: %s\n", g_ctx.vdac_csv_path);
+            }
+        }
         fflush(stdout);
     }
     if (g_ctx.diag_enabled) {
@@ -1646,6 +1949,7 @@ int main(int argc, char *argv[]) {
     if (g_ctx.sock_fd >= 0) close(g_ctx.sock_fd);
     pthread_mutex_destroy(&g_ctx.tcp_mutex);
     pthread_mutex_destroy(&g_ctx.fmt_mutex);
+    if (g_ctx.vdac_csv_file) fclose(g_ctx.vdac_csv_file);
 
     return 0;
 }
