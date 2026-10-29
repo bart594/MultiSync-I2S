@@ -25,7 +25,7 @@
 #include <linux/if_ether.h>
 #include <alsa/asoundlib.h>
 
-#define AP_VERSION "3.2-SINGLE-CORE-RV1106"
+#define AP_VERSION "3.2-RT-IDLE-FIX-RV1106"
 
 #define MAX_PACKET_SIZE       9216
 #define RING_BUFFER_SIZE      (4 * 1024 * 1024)
@@ -34,6 +34,9 @@
 #define SCREAM_FEEDBACK_MAGIC 0x53434642
 #define DEFAULT_TCP_PKT_SIZE  1157
 #define DEFAULT_PRELOAD_FRAMES 4096
+
+/* Max 1 ms latency when network/ALSA have no work; yield the single CPU. */
+#define ALSA_IDLE_SLEEP_US   1000
 
 typedef enum {
     MODE_UDP,
@@ -464,8 +467,9 @@ static void alsa_warmup(receiver_ctx_t *ctx, const scream_format_t *fmt, unsigne
     snd_pcm_uframes_t frames = rate / 20; /* 50 ms */
 
     snd_pcm_uframes_t buf_frames = 0;
-    snd_pcm_get_params(ctx->pcm_handle, &buf_frames, NULL);
-    if (buf_frames && frames > buf_frames)
+    snd_pcm_uframes_t period_frames = 0;
+    if (snd_pcm_get_params(ctx->pcm_handle, &buf_frames, &period_frames) == 0 &&
+        buf_frames > 0 && frames > buf_frames)
         frames = buf_frames;
 
     if (ctx->use_mmap_active) {
@@ -826,8 +830,12 @@ static void *alsa_thread_fn(void *arg) {
             continue;
         }
 
-        if (!ctx->fmt_initialized || __atomic_load_n(&ctx->fmt_failed, __ATOMIC_ACQUIRE))
+        /* On a single core SCHED_FIFO(85) must never busy-spin: the network
+         * worker (SCHED_FIFO(75)) needs CPU to receive the very first packet. */
+        if (!ctx->fmt_initialized || __atomic_load_n(&ctx->fmt_failed, __ATOMIC_ACQUIRE)) {
+            usleep(ALSA_IDLE_SLEEP_US);
             continue;
+        }
 
         size_t bytes_per_sample = (ctx->current_fmt.sample_size == 1) ? 4 : (ctx->current_fmt.sample_size / 8);
         size_t bpf = ctx->current_fmt.channels * bytes_per_sample;
@@ -840,14 +848,17 @@ static void *alsa_thread_fn(void *arg) {
 
         if (state == STATE_PREFILLING) {
             if (avail < preload_required) {
-                if (ctx->pcm_handle) snd_pcm_wait(ctx->pcm_handle, 20);
-                else usleep(5000);
+                /* We're waiting for NETWORK data, not ALSA free space.
+                 * snd_pcm_wait() can return immediately for ALSA 'null' and
+                 * starve the lower-priority network thread under SCHED_FIFO. */
+                usleep(ALSA_IDLE_SLEEP_US);
                 continue;
             }
             state = STATE_PLAYING;
         } else if (state == STATE_PLAYING) {
             if (avail < bpf) {
                 state = STATE_PREFILLING;
+                usleep(ALSA_IDLE_SLEEP_US);
                 continue;
             }
         }
@@ -867,7 +878,9 @@ static void *alsa_thread_fn(void *arg) {
 
                 if (++pll_ticks % 50 == 0) {
                     snd_pcm_uframes_t buf_size = 4096;
-                    snd_pcm_get_params(ctx->pcm_handle, &buf_size, NULL);
+                    snd_pcm_uframes_t period_size = 0;
+                    /* Both output pointers must be valid for alsa-lib. */
+                    snd_pcm_get_params(ctx->pcm_handle, &buf_size, &period_size);
 
                     long target_delay = buf_size / 2;
                     long error = (long)ema_delay - target_delay;
