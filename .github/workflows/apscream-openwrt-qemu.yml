@@ -1,4 +1,4 @@
-name: Build APScream IPK for OpenWrt 24.10.8 QEMU (VDAC 3.4)
+name: Build APScream IPK for OpenWrt 24.10.8 QEMU (PI Resync 3.5)
 
 on:
   workflow_dispatch:
@@ -13,6 +13,9 @@ jobs:
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4
+
+      - name: Sanity-check PI controller model
+        run: python3 tests/test_pi_model.py
 
       - name: Install SDK build dependencies
         run: |
@@ -40,10 +43,12 @@ jobs:
           cp ext_tree/package/apscream-open/apscream_open.c \
             sdk/package/apscream-open/src/apscream_open.c
           grep -q 'ALSA_IDLE_SLEEP_US' sdk/package/apscream-open/src/apscream_open.c
-          grep -q '3.4-VIRTUAL-DAC-RV1106' sdk/package/apscream-open/src/apscream_open.c
+          grep -q '3.5-PI-RESYNC-RV1106' sdk/package/apscream-open/src/apscream_open.c
           grep -q 'VDAC_RATE_PPM' sdk/package/apscream-open/src/apscream_open.c
+          grep -q 'vdac_pi_step' sdk/package/apscream-open/src/apscream_open.c
+          grep -q 'vdac_stop_and_prefill' sdk/package/apscream-open/src/apscream_open.c
           ! grep -q 'snd_pcm_get_params(.*NULL' sdk/package/apscream-open/src/apscream_open.c
-          echo 'APScream 3.4 virtual DAC from checkout; RT and ALSA fixes preserved'
+          echo 'APScream 3.5 PI resync from checkout; RT and ALSA fixes preserved'
 
       - name: Write OpenWrt package definition
         shell: bash
@@ -52,7 +57,7 @@ jobs:
           include $(TOPDIR)/rules.mk
 
           PKG_NAME:=apscream-open
-          PKG_VERSION:=3.4
+          PKG_VERSION:=3.5
           PKG_RELEASE:=1
           PKG_LICENSE:=UNKNOWN
           PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
@@ -108,7 +113,7 @@ jobs:
       - name: Upload OpenWrt package
         uses: actions/upload-artifact@v4
         with:
-          name: apscream-open-3.4-vdac-openwrt-24.10.8-armv7
+          name: apscream-open-3.5-pi-resync-openwrt-24.10.8-armv7
           path: release/apscream-open.ipk
           if-no-files-found: error
-          retention-days: 14 
+          retention-days: 14
